@@ -1,0 +1,476 @@
+import { Platform } from 'react-native';
+import * as SQLite from 'expo-sqlite';
+import { createTablesSQL } from './schema';
+import type { Account, Transaction } from './schema';
+
+let db: SQLite.SQLiteDatabase | null = null;
+
+// Web platform fallback using localStorage
+const isWeb = Platform.OS === 'web';
+
+// Web storage helpers
+const getStorageKey = (key: string) => `waste_transfer_${key}`;
+
+const webStorage = {
+  getItem: (key: string): string | null => {
+    if (isWeb && typeof window !== 'undefined') {
+      return window.localStorage.getItem(getStorageKey(key));
+    }
+    return null;
+  },
+  setItem: (key: string, value: string): void => {
+    if (isWeb && typeof window !== 'undefined') {
+      window.localStorage.setItem(getStorageKey(key), value);
+    }
+  },
+  removeItem: (key: string): void => {
+    if (isWeb && typeof window !== 'undefined') {
+      window.localStorage.removeItem(getStorageKey(key));
+    }
+  },
+};
+
+export async function initDatabase(): Promise<SQLite.SQLiteDatabase | null> {
+  if (db) {
+    return db;
+  }
+
+  // On Web platform, return null and use localStorage instead
+  if (isWeb) {
+    console.warn('SQLite is not fully supported on Web. Using localStorage fallback.');
+    return null;
+  }
+
+  try {
+    db = await SQLite.openDatabaseAsync('waste_transfer.db');
+    
+    // Enable foreign keys
+    await db.execAsync('PRAGMA foreign_keys = ON;');
+    
+    // Create tables
+    await db.execAsync(createTablesSQL);
+    
+    return db;
+  } catch (error) {
+    console.error('Failed to initialize database:', error);
+    return null;
+  }
+}
+
+export async function getDatabase(): Promise<SQLite.SQLiteDatabase | null> {
+  if (!db) {
+    return await initDatabase();
+  }
+  return db;
+}
+
+// Helper functions for Web platform
+function getWebAccounts(): Account[] {
+  const data = webStorage.getItem('accounts');
+  return data ? JSON.parse(data) : [];
+}
+
+function setWebAccounts(accounts: Account[]): void {
+  webStorage.setItem('accounts', JSON.stringify(accounts));
+}
+
+function getWebTransactions(): Transaction[] {
+  const data = webStorage.getItem('transactions');
+  return data ? JSON.parse(data) : [];
+}
+
+function setWebTransactions(transactions: Transaction[]): void {
+  webStorage.setItem('transactions', JSON.stringify(transactions));
+}
+
+// Account CRUD operations
+export async function createAccount(account: Omit<Account, 'created_at'>): Promise<Account> {
+  if (isWeb) {
+    const accounts = getWebAccounts();
+    const createdAt = new Date().toISOString();
+    const accountWithTimestamp = { ...account, created_at: createdAt } as Account;
+    accounts.push(accountWithTimestamp);
+    setWebAccounts(accounts);
+    return accountWithTimestamp;
+  }
+
+  const database = await getDatabase();
+  if (!database) throw new Error('Database not initialized');
+  
+  const createdAt = new Date().toISOString();
+  const accountWithTimestamp = { ...account, created_at: createdAt };
+  
+  await database.runAsync(
+    'INSERT INTO accounts (id, name, balance, icon, created_at) VALUES (?, ?, ?, ?, ?)',
+    [account.id, account.name, account.balance, account.icon, createdAt]
+  );
+  
+  return accountWithTimestamp as Account;
+}
+
+export async function getAccounts(): Promise<Account[]> {
+  if (isWeb) {
+    return getWebAccounts();
+  }
+
+  const database = await getDatabase();
+  if (!database) return [];
+  
+  const result = await database.getAllAsync<Account>('SELECT * FROM accounts ORDER BY created_at DESC');
+  return result;
+}
+
+export async function getAccountById(id: string): Promise<Account | null> {
+  if (isWeb) {
+    const accounts = getWebAccounts();
+    return accounts.find((acc) => acc.id === id) || null;
+  }
+
+  const database = await getDatabase();
+  if (!database) return null;
+  
+  const result = await database.getFirstAsync<Account>(
+    'SELECT * FROM accounts WHERE id = ?',
+    [id]
+  );
+  return result || null;
+}
+
+export async function updateAccount(id: string, updates: Partial<Omit<Account, 'id' | 'created_at'>>): Promise<void> {
+  if (isWeb) {
+    const accounts = getWebAccounts();
+    const index = accounts.findIndex((acc) => acc.id === id);
+    if (index !== -1) {
+      accounts[index] = { ...accounts[index], ...updates };
+      setWebAccounts(accounts);
+    }
+    return;
+  }
+
+  const database = await getDatabase();
+  if (!database) return;
+  
+  const fields: string[] = [];
+  const values: any[] = [];
+  
+  if (updates.name !== undefined) {
+    fields.push('name = ?');
+    values.push(updates.name);
+  }
+  if (updates.balance !== undefined) {
+    fields.push('balance = ?');
+    values.push(updates.balance);
+  }
+  if (updates.icon !== undefined) {
+    fields.push('icon = ?');
+    values.push(updates.icon);
+  }
+  
+  if (fields.length === 0) return;
+  
+  values.push(id);
+  await database.runAsync(
+    `UPDATE accounts SET ${fields.join(', ')} WHERE id = ?`,
+    values
+  );
+}
+
+export async function deleteAccount(id: string): Promise<void> {
+  if (isWeb) {
+    const accounts = getWebAccounts();
+    setWebAccounts(accounts.filter((acc) => acc.id !== id));
+    // Also delete related transactions
+    const transactions = getWebTransactions();
+    setWebTransactions(transactions.filter((t) => t.account_id !== id));
+    return;
+  }
+
+  const database = await getDatabase();
+  if (!database) return;
+  
+  await database.runAsync('DELETE FROM accounts WHERE id = ?', [id]);
+}
+
+// Transaction CRUD operations
+export async function createTransaction(
+  transaction: Omit<Transaction, 'created_at'>
+): Promise<Transaction> {
+  if (isWeb) {
+    const transactions = getWebTransactions();
+    const createdAt = new Date().toISOString();
+    const transactionWithTimestamp = { ...transaction, created_at: createdAt } as Transaction;
+    transactions.push(transactionWithTimestamp);
+    setWebTransactions(transactions);
+    
+    // Update account balance
+    const account = await getAccountById(transaction.account_id);
+    if (account) {
+      const newBalance =
+        transaction.type === 'income'
+          ? account.balance + transaction.amount
+          : account.balance - transaction.amount;
+      await updateAccount(transaction.account_id, { balance: newBalance });
+    }
+    
+    return transactionWithTimestamp;
+  }
+
+  const database = await getDatabase();
+  if (!database) throw new Error('Database not initialized');
+  
+  const createdAt = new Date().toISOString();
+  const transactionWithTimestamp = { ...transaction, created_at: createdAt };
+  
+  await database.runAsync(
+    `INSERT INTO transactions (id, type, amount, category, account_id, date, description, source, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      transaction.id,
+      transaction.type,
+      transaction.amount,
+      transaction.category,
+      transaction.account_id,
+      transaction.date,
+      transaction.description || null,
+      transaction.source || null,
+      createdAt,
+    ]
+  );
+  
+  // Update account balance
+  const account = await getAccountById(transaction.account_id);
+  if (account) {
+    const newBalance =
+      transaction.type === 'income'
+        ? account.balance + transaction.amount
+        : account.balance - transaction.amount;
+    await updateAccount(transaction.account_id, { balance: newBalance });
+  }
+  
+  return transactionWithTimestamp as Transaction;
+}
+
+export async function getTransactions(filters?: {
+  accountId?: string;
+  type?: 'income' | 'expense';
+  startDate?: string;
+  endDate?: string;
+}): Promise<Transaction[]> {
+  if (isWeb) {
+    let transactions = getWebTransactions();
+    
+    if (filters?.accountId) {
+      transactions = transactions.filter((t) => t.account_id === filters.accountId);
+    }
+    if (filters?.type) {
+      transactions = transactions.filter((t) => t.type === filters.type);
+    }
+    if (filters?.startDate) {
+      transactions = transactions.filter((t) => t.date >= filters.startDate!);
+    }
+    if (filters?.endDate) {
+      transactions = transactions.filter((t) => t.date <= filters.endDate!);
+    }
+    
+    return transactions.sort((a, b) => {
+      const dateCompare = b.date.localeCompare(a.date);
+      return dateCompare !== 0 ? dateCompare : b.created_at.localeCompare(a.created_at);
+    });
+  }
+
+  const database = await getDatabase();
+  if (!database) return [];
+  
+  let query = 'SELECT * FROM transactions WHERE 1=1';
+  const params: any[] = [];
+  
+  if (filters?.accountId) {
+    query += ' AND account_id = ?';
+    params.push(filters.accountId);
+  }
+  if (filters?.type) {
+    query += ' AND type = ?';
+    params.push(filters.type);
+  }
+  if (filters?.startDate) {
+    query += ' AND date >= ?';
+    params.push(filters.startDate);
+  }
+  if (filters?.endDate) {
+    query += ' AND date <= ?';
+    params.push(filters.endDate);
+  }
+  
+  query += ' ORDER BY date DESC, created_at DESC';
+  
+  const result = await database.getAllAsync<Transaction>(query, params);
+  return result;
+}
+
+export async function getTransactionById(id: string): Promise<Transaction | null> {
+  if (isWeb) {
+    const transactions = getWebTransactions();
+    return transactions.find((t) => t.id === id) || null;
+  }
+
+  const database = await getDatabase();
+  if (!database) return null;
+  
+  const result = await database.getFirstAsync<Transaction>(
+    'SELECT * FROM transactions WHERE id = ?',
+    [id]
+  );
+  return result || null;
+}
+
+export async function updateTransaction(
+  id: string,
+  updates: Partial<Omit<Transaction, 'id' | 'created_at'>>
+): Promise<void> {
+  if (isWeb) {
+    const transactions = getWebTransactions();
+    const index = transactions.findIndex((t) => t.id === id);
+    if (index !== -1) {
+      const oldTransaction = transactions[index];
+      transactions[index] = { ...transactions[index], ...updates };
+      setWebTransactions(transactions);
+      
+      // Update account balances if amount or type changed
+      if (updates.amount !== undefined || updates.type !== undefined || updates.account_id !== undefined) {
+        // Revert old transaction effect
+        const oldAccount = await getAccountById(oldTransaction.account_id);
+        if (oldAccount) {
+          const revertedBalance =
+            oldTransaction.type === 'income'
+              ? oldAccount.balance - oldTransaction.amount
+              : oldAccount.balance + oldTransaction.amount;
+          await updateAccount(oldTransaction.account_id, { balance: revertedBalance });
+        }
+        
+        // Apply new transaction effect
+        const newTransaction = transactions[index];
+        const newAccount = await getAccountById(newTransaction.account_id);
+        if (newAccount) {
+          const newBalance =
+            newTransaction.type === 'income'
+              ? newAccount.balance + newTransaction.amount
+              : newAccount.balance - newTransaction.amount;
+          await updateAccount(newTransaction.account_id, { balance: newBalance });
+        }
+      }
+    }
+    return;
+  }
+
+  const database = await getDatabase();
+  if (!database) return;
+  
+  // Get old transaction to update account balance
+  const oldTransaction = await getTransactionById(id);
+  if (!oldTransaction) return;
+  
+  const fields: string[] = [];
+  const values: any[] = [];
+  
+  if (updates.type !== undefined) {
+    fields.push('type = ?');
+    values.push(updates.type);
+  }
+  if (updates.amount !== undefined) {
+    fields.push('amount = ?');
+    values.push(updates.amount);
+  }
+  if (updates.category !== undefined) {
+    fields.push('category = ?');
+    values.push(updates.category);
+  }
+  if (updates.account_id !== undefined) {
+    fields.push('account_id = ?');
+    values.push(updates.account_id);
+  }
+  if (updates.date !== undefined) {
+    fields.push('date = ?');
+    values.push(updates.date);
+  }
+  if (updates.description !== undefined) {
+    fields.push('description = ?');
+    values.push(updates.description);
+  }
+  if (updates.source !== undefined) {
+    fields.push('source = ?');
+    values.push(updates.source);
+  }
+  
+  if (fields.length === 0) return;
+  
+  values.push(id);
+  await database.runAsync(
+    `UPDATE transactions SET ${fields.join(', ')} WHERE id = ?`,
+    values
+  );
+  
+  // Update account balances if amount or type changed
+  if (updates.amount !== undefined || updates.type !== undefined || updates.account_id !== undefined) {
+    // Revert old transaction effect
+    const oldAccount = await getAccountById(oldTransaction.account_id);
+    if (oldAccount) {
+      const revertedBalance =
+        oldTransaction.type === 'income'
+          ? oldAccount.balance - oldTransaction.amount
+          : oldAccount.balance + oldTransaction.amount;
+      await updateAccount(oldTransaction.account_id, { balance: revertedBalance });
+    }
+    
+    // Apply new transaction effect
+    const newTransaction = await getTransactionById(id);
+    if (newTransaction) {
+      const newAccount = await getAccountById(newTransaction.account_id);
+      if (newAccount) {
+        const newBalance =
+          newTransaction.type === 'income'
+            ? newAccount.balance + newTransaction.amount
+            : newAccount.balance - newTransaction.amount;
+        await updateAccount(newTransaction.account_id, { balance: newBalance });
+      }
+    }
+  }
+}
+
+export async function deleteTransaction(id: string): Promise<void> {
+  if (isWeb) {
+    const transaction = await getTransactionById(id);
+    if (transaction) {
+      const transactions = getWebTransactions();
+      setWebTransactions(transactions.filter((t) => t.id !== id));
+      
+      // Revert account balance
+      const account = await getAccountById(transaction.account_id);
+      if (account) {
+        const newBalance =
+          transaction.type === 'income'
+            ? account.balance - transaction.amount
+            : account.balance + transaction.amount;
+        await updateAccount(transaction.account_id, { balance: newBalance });
+      }
+    }
+    return;
+  }
+
+  const database = await getDatabase();
+  if (!database) return;
+  
+  // Get transaction to revert account balance
+  const transaction = await getTransactionById(id);
+  if (transaction) {
+    const account = await getAccountById(transaction.account_id);
+    if (account) {
+      const newBalance =
+        transaction.type === 'income'
+          ? account.balance - transaction.amount
+          : account.balance + transaction.amount;
+      await updateAccount(transaction.account_id, { balance: newBalance });
+    }
+  }
+  
+  await database.runAsync('DELETE FROM transactions WHERE id = ?', [id]);
+}
