@@ -1,6 +1,6 @@
 [build]
-  # 构建命令：进入 my-app 目录并构建 Web 版本，然后复制 _redirects 文件
-  command = "cd my-app && npm install && npx expo export --platform web && if exist public\\_redirects copy public\\_redirects dist\\_redirects"
+  # 构建命令：进入 my-app 目录并构建 Web 版本，然后复制 _redirects 文件（Linux 环境）
+  command = "cd my-app && npm install && npx expo export --platform web && cp public/_redirects dist/_redirects 2>/dev/null || true"
   # 发布目录：指向构建后的 dist 目录
   publish = "my-app/dist"
 
